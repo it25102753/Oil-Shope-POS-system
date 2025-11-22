@@ -117,6 +117,12 @@ def sales_page():
 def inventory_page():
     return render_template('inventory.html', user=current_user)
 
+@app.route('/stock-adjustment')
+@login_required
+@role_required('admin', 'manager')
+def stock_adjustment_page():
+    return render_template('stock_adjustment.html', user=current_user)
+
 @app.route('/suppliers')
 @login_required
 @role_required('admin', 'manager')
@@ -495,6 +501,104 @@ def get_low_stock():
         cursor.close()
         conn.close()
         return jsonify(products)
+    return jsonify({'error': 'Database connection failed'}), 500
+
+# Manual Stock Adjustment APIs
+@app.route('/api/inventory/adjust', methods=['POST'])
+@login_required
+@role_required('admin', 'manager')
+def adjust_stock():
+    data = request.get_json()
+    conn = get_db_connection()
+    if conn:
+        cursor = conn.cursor(dictionary=True)
+        try:
+            # Get current product quantity
+            cursor.execute("SELECT quantity, name FROM products WHERE id = %s", (data['product_id'],))
+            product = cursor.fetchone()
+            
+            if not product:
+                return jsonify({'error': 'Product not found'}), 404
+            
+            old_quantity = product['quantity']
+            adjustment_type = data['adjustment_type']  # 'add' or 'subtract'
+            adjustment_quantity = data['quantity']
+            
+            # Calculate new quantity
+            if adjustment_type == 'add':
+                new_quantity = old_quantity + adjustment_quantity
+            elif adjustment_type == 'subtract':
+                new_quantity = old_quantity - adjustment_quantity
+                if new_quantity < 0:
+                    return jsonify({'error': 'Cannot reduce stock below zero'}), 400
+            else:
+                return jsonify({'error': 'Invalid adjustment type'}), 400
+            
+            # Update product quantity
+            cursor.execute("""
+                UPDATE products SET quantity = %s WHERE id = %s
+            """, (new_quantity, data['product_id']))
+            
+            # Log the adjustment (create this table in your database)
+            cursor.execute("""
+                INSERT INTO stock_adjustments 
+                (product_id, old_quantity, new_quantity, adjustment_quantity, 
+                 adjustment_type, reason, employee_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (data['product_id'], old_quantity, new_quantity, adjustment_quantity,
+                  adjustment_type, data.get('reason', ''), current_user.id))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return jsonify({
+                'success': True, 
+                'old_quantity': old_quantity,
+                'new_quantity': new_quantity
+            })
+        except Error as e:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            return jsonify({'error': str(e)}), 400
+    return jsonify({'error': 'Database connection failed'}), 500
+
+@app.route('/api/inventory/adjustments', methods=['GET'])
+@login_required
+@role_required('admin', 'manager')
+def get_stock_adjustments():
+    product_id = request.args.get('product_id')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    
+    conn = get_db_connection()
+    if conn:
+        cursor = conn.cursor(dictionary=True)
+        query = """
+            SELECT sa.*, p.name as product_name, p.barcode,
+                   e.username as employee_name
+            FROM stock_adjustments sa
+            JOIN products p ON sa.product_id = p.id
+            JOIN employees e ON sa.employee_id = e.id
+            WHERE 1=1
+        """
+        params = []
+        
+        if product_id:
+            query += " AND sa.product_id = %s"
+            params.append(product_id)
+        
+        if start_date and end_date:
+            query += " AND DATE(sa.created_at) BETWEEN %s AND %s"
+            params.extend([start_date, end_date])
+        
+        query += " ORDER BY sa.created_at DESC LIMIT 100"
+        
+        cursor.execute(query, params)
+        adjustments = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return jsonify(adjustments)
     return jsonify({'error': 'Database connection failed'}), 500
 
 # User Management APIs
